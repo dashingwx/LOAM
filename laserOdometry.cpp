@@ -491,7 +491,7 @@ int main(int argc, char** argv)
       newSurfPointsLessFlat = false;
       newLaserCloudFullRes = false;
       newImuTrans = false;
-
+        
       //将第一个点云数据集发送给laserMapping,从下一个点云数据开始处理
       if (!systemInited) {
         //将cornerPointsLessSharp与laserCloudCornerLast交换,目的保存cornerPointsLessSharp的值下轮使用，将当前帧的次尖锐角点（cornerPointsLessSharp）​与上一帧的边沿特征点（laserCloudCornerLast）​交换
