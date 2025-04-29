@@ -975,3 +975,246 @@ int main(int argc, char** argv)
                 }
               }
             }
+//计算当前位姿的旋转角（transformTobeMapped[0-2]，分别对应绕X、Y、Z轴的旋转）的正弦和余弦值。
+            float srx = sin(transformTobeMapped[0]);
+            float crx = cos(transformTobeMapped[0]);
+            float sry = sin(transformTobeMapped[1]);
+            float cry = cos(transformTobeMapped[1]);
+            float srz = sin(transformTobeMapped[2]);
+            float crz = cos(transformTobeMapped[2]);
+
+            int laserCloudSelNum = laserCloudOri->points.size();
+            if (laserCloudSelNum < 50) {//如果特征点太少
+              continue;
+            }
+
+            cv::Mat matA(laserCloudSelNum, 6, CV_32F, cv::Scalar::all(0));// 雅可比矩阵
+            cv::Mat matAt(6, laserCloudSelNum, CV_32F, cv::Scalar::all(0));// A的转置
+            cv::Mat matAtA(6, 6, CV_32F, cv::Scalar::all(0));             // A^T A
+            cv::Mat matB(laserCloudSelNum, 1, CV_32F, cv::Scalar::all(0)); // 残差向量
+            cv::Mat matAtB(6, 1, CV_32F, cv::Scalar::all(0));              // A^T B
+            cv::Mat matX(6, 1, CV_32F, cv::Scalar::all(0));                // 解向量
+            for (int i = 0; i < laserCloudSelNum; i++) {//雅可比矩阵计算
+              pointOri = laserCloudOri->points[i];
+              coeff = coeffSel->points[i];
+              // 计算雅可比矩阵的三个旋转分量 (arx, ary, arz)
+              float arx = (crx*sry*srz*pointOri.x + crx*crz*sry*pointOri.y - srx*sry*pointOri.z) * coeff.x
+                        + (-srx*srz*pointOri.x - crz*srx*pointOri.y - crx*pointOri.z) * coeff.y
+                        + (crx*cry*srz*pointOri.x + crx*cry*crz*pointOri.y - cry*srx*pointOri.z) * coeff.z;
+
+              float ary = ((cry*srx*srz - crz*sry)*pointOri.x 
+                        + (sry*srz + cry*crz*srx)*pointOri.y + crx*cry*pointOri.z) * coeff.x
+                        + ((-cry*crz - srx*sry*srz)*pointOri.x 
+                        + (cry*srz - crz*srx*sry)*pointOri.y - crx*sry*pointOri.z) * coeff.z;
+
+              float arz = ((crz*srx*sry - cry*srz)*pointOri.x + (-cry*crz-srx*sry*srz)*pointOri.y)*coeff.x
+                        + (crx*crz*pointOri.x - crx*srz*pointOri.y) * coeff.y
+                        + ((sry*srz + cry*crz*srx)*pointOri.x + (crz*sry-cry*srx*srz)*pointOri.y)*coeff.z;
+              // 绕X轴的旋转对误差的影响
+              matA.at<float>(i, 0) = arx;
+              matA.at<float>(i, 1) = ary;
+              matA.at<float>(i, 2) = arz;
+              matA.at<float>(i, 3) = coeff.x;
+              matA.at<float>(i, 4) = coeff.y;
+              matA.at<float>(i, 5) = coeff.z;
+              matB.at<float>(i, 0) = -coeff.intensity;
+            }
+            cv::transpose(matA, matAt);// 计算A的转置
+            matAtA = matAt * matA;            // 计算A^T A
+            matAtB = matAt * matB;            // 计算A^T B
+            cv::solve(matAtA, matAtB, matX, cv::DECOMP_QR); // QR分解求解Δx
+
+            //退化场景判断与处理
+            if (iterCount == 0) {
+              cv::Mat matE(1, 6, CV_32F, cv::Scalar::all(0));
+              cv::Mat matV(6, 6, CV_32F, cv::Scalar::all(0));
+              cv::Mat matV2(6, 6, CV_32F, cv::Scalar::all(0));
+
+              cv::eigen(matAtA, matE, matV);
+              matV.copyTo(matV2);
+
+              isDegenerate = false;
+              float eignThre[6] = {100, 100, 100, 100, 100, 100};
+              for (int i = 5; i >= 0; i--) {
+                if (matE.at<float>(0, i) < eignThre[i]) {
+                  for (int j = 0; j < 6; j++) {
+                    matV2.at<float>(i, j) = 0;
+                  }
+                  isDegenerate = true;
+                } else {
+                  break;
+                }
+              }
+              matP = matV.inv() * matV2;
+            }
+
+            if (isDegenerate) {
+              cv::Mat matX2(6, 1, CV_32F, cv::Scalar::all(0));
+              matX.copyTo(matX2);
+              matX = matP * matX2;
+            }
+
+            //积累每次的调整量
+            transformTobeMapped[0] += matX.at<float>(0, 0);
+            transformTobeMapped[1] += matX.at<float>(1, 0);
+            transformTobeMapped[2] += matX.at<float>(2, 0);
+            transformTobeMapped[3] += matX.at<float>(3, 0);
+            transformTobeMapped[4] += matX.at<float>(4, 0);
+            transformTobeMapped[5] += matX.at<float>(5, 0);
+
+            float deltaR = sqrt(
+                                pow(rad2deg(matX.at<float>(0, 0)), 2) +
+                                pow(rad2deg(matX.at<float>(1, 0)), 2) +
+                                pow(rad2deg(matX.at<float>(2, 0)), 2));
+            float deltaT = sqrt(
+                                pow(matX.at<float>(3, 0) * 100, 2) +
+                                pow(matX.at<float>(4, 0) * 100, 2) +
+                                pow(matX.at<float>(5, 0) * 100, 2));
+
+            //旋转平移量足够小就停止迭代
+            if (deltaR < 0.05 && deltaT < 0.05) {
+              break;
+            }
+          }
+
+          //迭代结束更新相关的转移矩阵
+          transformUpdate();
+        }
+
+        //将corner points按距离（比例尺缩小）归入相应的立方体
+        for (int i = 0; i < laserCloudCornerStackNum; i++) {
+          //转移到世界坐标系
+          pointAssociateToMap(&laserCloudCornerStack->points[i], &pointSel);
+
+          //按50的比例尺缩小，四舍五入，偏移laserCloudCen*的量，计算索引
+          int cubeI = int((pointSel.x + 25.0) / 50.0) + laserCloudCenWidth;
+          int cubeJ = int((pointSel.y + 25.0) / 50.0) + laserCloudCenHeight;
+          int cubeK = int((pointSel.z + 25.0) / 50.0) + laserCloudCenDepth;
+
+          if (pointSel.x + 25.0 < 0) cubeI--;
+          if (pointSel.y + 25.0 < 0) cubeJ--;
+          if (pointSel.z + 25.0 < 0) cubeK--;
+
+          if (cubeI >= 0 && cubeI < laserCloudWidth && 
+              cubeJ >= 0 && cubeJ < laserCloudHeight && 
+              cubeK >= 0 && cubeK < laserCloudDepth) {//只挑选-laserCloudCenWidth * 50.0 < point.x < laserCloudCenWidth * 50.0范围内的点，y和z同理
+              //按照尺度放进不同的组，每个组的点数量各异
+            int cubeInd = cubeI + laserCloudWidth * cubeJ + laserCloudWidth * laserCloudHeight * cubeK;
+            laserCloudCornerArray[cubeInd]->push_back(pointSel);
+          }
+        }
+
+        //将surf points按距离（比例尺缩小）归入相应的立方体
+        for (int i = 0; i < laserCloudSurfStackNum; i++) {
+          pointAssociateToMap(&laserCloudSurfStack->points[i], &pointSel);
+
+          int cubeI = int((pointSel.x + 25.0) / 50.0) + laserCloudCenWidth;
+          int cubeJ = int((pointSel.y + 25.0) / 50.0) + laserCloudCenHeight;
+          int cubeK = int((pointSel.z + 25.0) / 50.0) + laserCloudCenDepth;
+
+          if (pointSel.x + 25.0 < 0) cubeI--;
+          if (pointSel.y + 25.0 < 0) cubeJ--;
+          if (pointSel.z + 25.0 < 0) cubeK--;
+
+          if (cubeI >= 0 && cubeI < laserCloudWidth && 
+              cubeJ >= 0 && cubeJ < laserCloudHeight && 
+              cubeK >= 0 && cubeK < laserCloudDepth) {
+            int cubeInd = cubeI + laserCloudWidth * cubeJ + laserCloudWidth * laserCloudHeight * cubeK;
+            laserCloudSurfArray[cubeInd]->push_back(pointSel);
+          }
+        }
+
+        //特征点下采样
+        for (int i = 0; i < laserCloudValidNum; i++) {
+          int ind = laserCloudValidInd[i];
+
+          laserCloudCornerArray2[ind]->clear();
+          downSizeFilterCorner.setInputCloud(laserCloudCornerArray[ind]);
+          downSizeFilterCorner.filter(*laserCloudCornerArray2[ind]);//滤波输出到Array2
+
+          laserCloudSurfArray2[ind]->clear();
+          downSizeFilterSurf.setInputCloud(laserCloudSurfArray[ind]);
+          downSizeFilterSurf.filter(*laserCloudSurfArray2[ind]);
+
+          //Array与Array2交换，即滤波后自我更新
+          pcl::PointCloud<PointType>::Ptr laserCloudTemp = laserCloudCornerArray[ind];
+          laserCloudCornerArray[ind] = laserCloudCornerArray2[ind];
+          laserCloudCornerArray2[ind] = laserCloudTemp;
+
+          laserCloudTemp = laserCloudSurfArray[ind];
+          laserCloudSurfArray[ind] = laserCloudSurfArray2[ind];
+          laserCloudSurfArray2[ind] = laserCloudTemp;
+        }
+
+        mapFrameCount++;
+        //特征点汇总下采样，每隔五帧publish一次，从第一次开始
+        if (mapFrameCount >= mapFrameNum) {
+          mapFrameCount = 0;
+
+          laserCloudSurround2->clear();
+          for (int i = 0; i < laserCloudSurroundNum; i++) {
+            int ind = laserCloudSurroundInd[i];
+            *laserCloudSurround2 += *laserCloudCornerArray[ind];
+            *laserCloudSurround2 += *laserCloudSurfArray[ind];
+          }
+
+          laserCloudSurround->clear();
+          downSizeFilterCorner.setInputCloud(laserCloudSurround2);
+          downSizeFilterCorner.filter(*laserCloudSurround);
+
+          sensor_msgs::PointCloud2 laserCloudSurround3;
+          pcl::toROSMsg(*laserCloudSurround, laserCloudSurround3);
+          laserCloudSurround3.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+          laserCloudSurround3.header.frame_id = "/camera_init";
+          pubLaserCloudSurround.publish(laserCloudSurround3);
+        }
+
+        //将点云中全部点转移到世界坐标系下
+        int laserCloudFullResNum = laserCloudFullRes->points.size();
+        for (int i = 0; i < laserCloudFullResNum; i++) {
+          pointAssociateToMap(&laserCloudFullRes->points[i], &laserCloudFullRes->points[i]);
+        }
+
+        sensor_msgs::PointCloud2 laserCloudFullRes3;
+        pcl::toROSMsg(*laserCloudFullRes, laserCloudFullRes3);
+        laserCloudFullRes3.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+        laserCloudFullRes3.header.frame_id = "/camera_init";
+        pubLaserCloudFullRes.publish(laserCloudFullRes3);
+
+        geometry_msgs::Quaternion geoQuat = tf::createQuaternionMsgFromRollPitchYaw
+                                  (transformAftMapped[2], -transformAftMapped[0], -transformAftMapped[1]);
+
+        odomAftMapped.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+        odomAftMapped.pose.pose.orientation.x = -geoQuat.y;
+        odomAftMapped.pose.pose.orientation.y = -geoQuat.z;
+        odomAftMapped.pose.pose.orientation.z = geoQuat.x;
+        odomAftMapped.pose.pose.orientation.w = geoQuat.w;
+        odomAftMapped.pose.pose.position.x = transformAftMapped[3];
+        odomAftMapped.pose.pose.position.y = transformAftMapped[4];
+        odomAftMapped.pose.pose.position.z = transformAftMapped[5];
+        //扭转量
+        odomAftMapped.twist.twist.angular.x = transformBefMapped[0];
+        odomAftMapped.twist.twist.angular.y = transformBefMapped[1];
+        odomAftMapped.twist.twist.angular.z = transformBefMapped[2];
+        odomAftMapped.twist.twist.linear.x = transformBefMapped[3];
+        odomAftMapped.twist.twist.linear.y = transformBefMapped[4];
+        odomAftMapped.twist.twist.linear.z = transformBefMapped[5];
+        pubOdomAftMapped.publish(odomAftMapped);
+
+        //广播坐标系旋转平移参量
+        aftMappedTrans.stamp_ = ros::Time().fromSec(timeLaserOdometry);
+        aftMappedTrans.setRotation(tf::Quaternion(-geoQuat.y, -geoQuat.z, geoQuat.x, geoQuat.w));
+        aftMappedTrans.setOrigin(tf::Vector3(transformAftMapped[3], 
+                                             transformAftMapped[4], transformAftMapped[5]));
+        tfBroadcaster.sendTransform(aftMappedTrans);
+
+      }
+    }
+
+    status = ros::ok();
+    rate.sleep();
+  }
+
+  return 0;
+}
+
